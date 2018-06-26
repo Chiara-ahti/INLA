@@ -1,0 +1,173 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+```{r}
+setwd("")
+
+install.packages("INLA", repos="https://inla.r-inla-download.org/R/stable", dep=TRUE)
+source("http://www.math.ntnu.no/inla/givemeINLA.R")
+inla.upgrade(testing=TRUE)
+#install.packages("maptools")
+#install.packages("spdep")
+
+library("INLA")
+inla.update(testing = F)
+install.packages("gpclib")
+library("gpclib")
+library("maptools")
+library("spdep")
+
+## Upload Amsterdam shape file
+amsmap <- readShapePoly("amsmap_hiv.shp")
+
+## Transform the shape file into an adjacency matrix and to make it compatible with the R-INLA format
+temp <- poly2nb(amsmap)
+nb2INLA("AMS.graph",temp)
+AMS.adj <- paste(getwd(),"/AMS.graph",sep="")
+
+## Import the AMS.adj graph in R-INLA and obtain the adjacency matrix
+H <- inla.read.graph(filename="AMS.graph")
+image(inla.graph2matrix(H),xlab="",ylab="")
+
+```
+
+```{r}
+
+## Specify formula for the model
+## ID represents the identifiers for the boroughs and through the 'graph' option
+## we include the name of the object containing the neighborhood structure
+formula <- y ~ 1 + f(ID, model="bym",graph=AMS.adj, scale.model=TRUE, hyper=list(prec.unstruct=list(prior="loggamma",param=c(1,0.001)), prec.spatial=list(prior="loggamma",param=c(1,0.001))))
+
+
+#Upload HIV data
+data.hiv <- read.csv("data_hiv.csv")
+data.hiv <- data.hiv[,-1]
+Nareas <- length(data.hiv[,1])
+
+# The order of the areas needs to be the same between the data and the spatial polygon object obtained importing the shapefile, so we re-order the data
+data.boroughs <- attr(amsmap, "data")
+data.boroughs <- data.boroughs[data.boroughs$PC4 %in% data.hiv$PC4,]
+order <- match(data.boroughs$PC4,data.hiv$PC4)
+data.hiv <- data.hiv[order,]
+data.hiv$ID <- seq(1,Nareas)
+
+# Include in the amsmap dataframe the ID variable  
+attr(amsmap, "data") <- merge(data.boroughs,data.hiv,by=c("PC4"))
+
+```
+
+```{r}
+##Run model
+mod.hiv <- inla(formula,family="poisson",
+                     data=data.hiv, E=data.hiv$E,
+                     control.compute=list(dic=TRUE))
+
+round(mod.hiv$summary.fixed,3) #summary info (posterior mean and SD)
+round(head(mod.hiv$summary.random$ID),3) #partial output
+#round(mod.hiv$summary.random$ID,3) 
+#mod.hiv$marginals.fixed
+
+
+exp.b0.mean <- inla.emarginal(exp,mod.hiv$marginals.fixed[[1]]) #posterior mean
+exp.b0.mean  # does it mean an HIV rate of 86% in Amsterdam?
+exp.b0.95CI <- inla.qmarginal(c(0.025,0.975), inla.tmarginal(exp,mod.hiv$marginals.fixed[[1]]))
+exp.b0.95CI
+
+names(mod.hiv$marginals.fixed)
+
+```
+
+```{r}
+
+# *** Code for Figure 6.6 left - map of the posterior mean for the borough-specific relative risks of acquiring HIV, compared to the whole of Amsterdam
+csi <- mod.hiv$marginals.random$ID[1:Nareas]
+zeta <- lapply(csi,function(x) inla.emarginal(exp,x))
+# Define the cutoff for zeta
+zeta.cutoff <- c(0.6, 0.9, 1.2, 1.5, 1.8, 2.2, 2.6)
+# Transform zeta in categorical variable
+cat.zeta <- cut(unlist(zeta),breaks=zeta.cutoff,include.lowest=TRUE)
+# Create a dataframe with all the information needed for the map
+maps.cat.zeta <- data.frame(ID=data.hiv$ID, cat.zeta=cat.zeta)
+# Add the categorized zeta to the spatial polygon
+data.boroughs <- attr(amsmap, "data")
+attr(amsmap, "data") <- merge(data.boroughs, maps.cat.zeta, by="ID")
+
+#map of the posterior mean for the area specific relative risk of HIV compared to the whole Amsterdam
+library(lattice) # required for trellis.par.set():
+trellis.par.set(sp.theme()) # sets color ramp to bpy.colors()
+library(RColorBrewer)
+my.palette <- brewer.pal(n = 7, name = "OrRd")
+#display.brewer.all()
+
+windows()
+#spplot(obj=amsmap, zcol= "cat.zeta", col.regions=gray(seq(0.9,0.1,length=6)), asp=1)
+spplot(obj=amsmap, zcol= "cat.zeta", col.regions=my.palette,cuts = 6, asp=1)
+
+```
+
+
+```{r}
+# *** Code for Figure 6.6 right - The uncertainty associated with the posterior means
+a <- 0
+prob.csi <- lapply(csi, function(x) {1 - inla.pmarginal(a, x)})
+prob.csi.cutoff <- c(0,0.2,0.8,1.1)
+cat.prob.csi <- cut(unlist(prob.csi),breaks=prob.csi.cutoff, include.lowest=TRUE)
+#Create a dataframe with all the information needed for the map
+maps.cat.prob.csi <- data.frame(ID=data.hiv$ID, cat.prob.csi=cat.prob.csi)
+#Add the categorized zetea to the spatial polygon
+data.boroughs <- attr(amsmap, "data")
+attr(amsmap, "data") <- merge(data.boroughs, maps.cat.prob.csi, by="ID")
+
+#Map of the probability (uncertainty) associated with the posterior means
+windows()
+spplot(obj=amsmap, zcol= "cat.prob.csi", col.regions=my.palette,cuts = 4, asp=1)
+# ***
+
+````
+
+```{r}
+## Finally, it could be interesting to evaluate the proportion of variance explained by the 
+#@ structured spatial component. 
+## To obtain this in INLA, a simulation-based approach is used. For each area we extract a
+#@ large enough number of values (e.g., 100 000) from the corresponding marginal posterior 
+#@ distribution of v_i and save the simulated values in a matrix with rows equal to the 
+#@ number of areas and 100 000 columns. Then we calculate the emperical variance (over column)
+
+mat.marg <- matrix(NA, nrow=Nareas, ncol=100000)
+m <- mod.hiv$marginals.random$ID
+for (i in 1:Nareas){
+  # Remember that the first Nareas values of the random effects
+  # are u+v, while u values are stored in the Nareas+1 to 2*Nareas elements.
+  u <- m[[Nareas+i]]
+  mat.marg[i,] <- inla.rmarginal(100000, u)
+}
+var.u <- apply(mat.marg, 2, var)  ##the emperical variance (over column) of u (the spatially structured component)
+
+##expected value of the variance for v (the unstructured component) is calculated as
+var.v <- inla.rmarginal(100000,inla.tmarginal(function(x) 1/x,
+                                              mod.hiv$marginals.hyper$"Precision for ID (iid component)"))
+```
+
+```{r}
+##Finally, we compute the spatial fractional variance as
+perc.var.u <- mean(var.u/(var.u+var.v))  
+perc.var.u   #0.1586617
+
+## In the case of HIV in Amsterdam, the proportion of spatial variance is about 0.16,
+# @suggesting that only a small part of the variability is explained by the spatial structure.
+
+marg.hyper <- inla.hyperpar.sample(100000,mod.hiv)
+perc.var.u1 <- mean(marg.hyper[,1] / (marg.hyper[,1]+marg.hyper[,2]))
+perc.var.u1
+
+```
+
+
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.
